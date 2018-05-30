@@ -1,0 +1,439 @@
+---
+title: "Bulk TCR repertoire analysis"
+output: html_notebook
+---
+
+
+
+
+Load libraries
+
+```{r}
+library(tcR, quietly = T) # library to process TCR repertoire samples
+library(ggseqlogo) # plot logos of sequence motifs
+library(pheatmap) # plot (pretty) heatmaps
+library(plotly) # interactive plotting
+```
+
+
+
+# Data processing
+Example commands for using MixCR to process repertoire sequencing data
+Parallelizing and multithreading these steps is highly advised. Single threaded analysis can run for ~2 hours
+More info in: https://github.com/milaboratory/mixcr
+
+```{bash, eval = FALSE}
+# align with TCR reference
+## alignment can be done only against reference of interest (if testing TCR beta repertoire only align against those)
+mixcr align -r sample_TCRA.log -t 10 -f -c TRA -s hs sample_TCRA_1.fastq sample_TCRA_1.fastq sample_TCRA.vdjca
+mixcr align -r sample_TCRB.log -t 10 -f -c TRB -s hs sample_TCRB_1.fastq sample_TCRB_1.fastq sample_TCRB.vdjca
+
+# TCR sequence assembly
+mixcr assemble -r sample_TCRA.log -t 10 -f sample_TCRA.vdjca sample_TCRA.clns
+mixcr assemble -r sample_TCRB.log -t 10 -f sample_TCRA.vdjca sample_TCRB.clns
+
+# export output to a readable table format
+mixcr exportClones sample_TCRA.clns sample_TCRA.txt
+mixcr exportClones sample_TCRB.clns sample_TCRB.txt
+```
+
+
+
+# Data preparation
+Load data (approx. 5min with this example)
+
+```{r, eval = FALSE}
+system("gzip -d test_data/*gz") # unzip test files
+cln_txt = list.files(path = "./test_data/", pattern = ".txt") # list all test files
+cln_glio_raw = lapply(paste0("./test_data/", cln_txt), 
+                       function(x){parse.mixcr(x)}) # parse test files
+names(cln_glio_raw) = sapply(strsplit(cln_txt, ".", fixed = T), function(x) x[1])
+
+# get sample metadata from file names
+metadata = data.frame(t(sapply(strsplit(names(cln_glio_raw), "_"), rbind)), stringsAsFactors = F)
+rownames(metadata) = names(cln_glio_raw)
+colnames(metadata) = c("condition", "repertoire", "tissue")
+
+#save(metadata, cln_glio_raw, file = "all_test_data.RData")
+```
+
+
+
+Load .RData with all needed objects (faster than previous code)
+
+```{r}
+load("all_test_data.RData")
+```
+
+
+
+
+Out of frame TCR sequences are non functional but can still appear. In https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3872299/: "...out-of-frame (i.e., non-functional and thus not subjected to selection) and in-frame TCR beta repertoires, we also show the extent of the impact of thymic selection and the common trends in how this process shapes individual repertoires.""
+Filtering clonotypes in frame/not in frame:
+
+```{r}
+cln_glio_list <- get.inframes(cln_glio_raw)
+```
+
+
+
+# Basic stats about the dataset
+Compute basic stats
+
+```{r}
+basic_stats = cloneset.stats(cln_glio_list)
+basic_stats
+```
+
+
+
+Stats about clonal proportion
+
+```{r}
+# how many clones to make up 25% of the reads?
+clonal_prop = clonal.proportion(cln_glio_list, 25)
+
+# proportion taken by the top-10 clonotypes
+top_clon_prop = top.proportion(cln_glio_list, 10) 
+vis.top.proportions(cln_glio_list)
+
+# clonotype expansion - what proportion of clonotypes fit a certain interval of abundance (as % of total clonotypes)
+clonal_space = clonal.space.homeostasis(cln_glio_list)
+pheatmap(t(clonal_space), cluster_rows = F)
+```
+
+
+
+# CDR3 features
+CDR3 (nucleotide) length distribution can give us clues about the clonotype diversity. A more skewed distribution implies greater representation of one or a few clonotypes.
+
+```{r}
+vis.count.len(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+              .col = "Read.count", .ncol = 2)
+vis.count.len(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+              .col = "Read.count", .ncol = 2)
+```
+
+
+
+Sequence logo for the CDR3 sequence - any evident motifs?
+The most correct way to run this analysis would be to have the CDR3 sequences aligned with each other since they can have different lengths. The following code serves mostly as an example on how to plot this in R.
+
+```{r}
+plot_list = list()
+for(n in names(cln_glio_list)){
+  km <- get.kmers(cln_glio_list[[n]]$CDR3.amino.acid.sequence, .head = 100, .k = 16, .verbose = F)
+  d <- kmer.profile(km)
+  plot_list[[n]] = ggseqlogo(as.matrix(round(d[,-1]*100, 0)), method = 'prob') + ggtitle(n)
+  print(plot_list[[n]])
+}
+```
+
+
+
+# Gene segment analysis
+## Gene segment usage
+Plot gene usage (combinations) in heatmaps
+Normalization is required to account for library size, especially when comparing between samples
+
+```{r}
+# V segment usage
+BV_usage = geneUsage(cln_glio_list, HUMAN_TRBV, .norm = T)
+rownames(BV_usage) = BV_usage[,1]
+BV_usage = BV_usage[,-1]
+BV_usage = BV_usage[,!apply(BV_usage, 2, function(x) all(is.na(x)))]
+AV_usage = geneUsage(cln_glio_list, HUMAN_TRAV, .norm = T)
+rownames(AV_usage) = AV_usage[,1]
+AV_usage = AV_usage[,-1]
+AV_usage = AV_usage[,!apply(AV_usage, 2, function(x) all(is.na(x)))]
+
+# J segment usage
+BJ_usage = geneUsage(cln_glio_list, HUMAN_TRBJ, .norm = T)
+rownames(BJ_usage) = BJ_usage[,1]
+BJ_usage = BJ_usage[,-1]
+BJ_usage = BJ_usage[,!apply(BJ_usage, 2, function(x) all(is.na(x)))]
+AJ_usage = geneUsage(cln_glio_list, HUMAN_TRAJ, .norm = T)
+rownames(AJ_usage) = AJ_usage[,1]
+AJ_usage = AJ_usage[,-1]
+AJ_usage = AJ_usage[,!apply(AJ_usage, 2, function(x) all(is.na(x)))]
+
+both_usage = list()
+for(n in names(cln_glio_list)){
+  if(metadata[n,"repertoire"]=="TCRB"){
+    both_usage[[n]] = geneUsage(cln_glio_list[[n]], list(HUMAN_TRBV, HUMAN_TRBJ), .norm = T)
+  } else{
+    both_usage[[n]] = geneUsage(cln_glio_list[[n]], list(HUMAN_TRAV, HUMAN_TRAJ), .norm = T)
+  }
+}
+
+# how are the different samples distinguished by segment usage?
+pheatmap::pheatmap(t(BV_usage))
+pheatmap::pheatmap(t(AV_usage))
+pheatmap::pheatmap(t(BJ_usage))
+pheatmap::pheatmap(t(AJ_usage))
+
+# what are the segment combination biases per sample?
+pheatmap::pheatmap(t(both_usage$glioma_TCRB_blood), main = "glioma_TCRB_blood")
+pheatmap::pheatmap(t(both_usage$glioma_TCRB_brain), main = "glioma_TCRB_brain")
+pheatmap::pheatmap(t(both_usage$healthy_TCRB_blood), main = "healthy_TCRB_blood")
+pheatmap::pheatmap(t(both_usage$healthy_TCRB_brain), main = "healthy_TCRB_brain")
+```
+
+
+
+## Gene segment comparison by information distance
+Information on diversity measures: https://en.wikipedia.org/wiki/Diversity_index
+Entropy - measure of how unpredictable the data is. The larger the entropy, the more diverse (in this case the repertoire).
+Compute repertoire entropy
+
+```{r, warning=FALSE}
+# V segment usage entropy
+BV_entropy = entropy.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], HUMAN_TRBV)
+AV_entropy = entropy.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], HUMAN_TRAV)
+
+# J segment usage entropy
+BJ_entropy = entropy.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], HUMAN_TRBJ)
+AJ_entropy = entropy.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], HUMAN_TRAJ)
+
+
+# plot
+TCRB_df = data.frame(V_seg = BV_entropy,
+                     J_seg = BJ_entropy)
+TCRB_df = merge(TCRB_df, metadata, by = 0)
+
+ggplot(TCRB_df, aes(x = V_seg, y = J_seg, colour = condition, shape = tissue))+
+  geom_point()+
+  scale_shape_manual(values = c(2, 19))+
+  ggtitle("TCR beta gene segment entropy")+
+  theme_classic()+
+  theme(aspect.ratio = 1)
+
+TCRA_df = data.frame(V_seg = AV_entropy,
+                     J_seg = AJ_entropy)
+TCRA_df = merge(TCRA_df, metadata, by = 0)
+ggplot(TCRA_df, aes(x = V_seg, y = J_seg, colour = condition, shape = tissue))+
+  geom_point()+
+  scale_shape_manual(values = c(2, 19))+
+  ggtitle("TCR alpha gene segment entropy")+
+  theme_classic()+
+  theme(aspect.ratio = 1)
+```
+
+
+
+Other measures of repertoire diversity
+
+```{r}
+# True diversity - the most fundamental measure of diversity, a few others are derived from this one
+repDiversity(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 'div', 'read.count', 
+             .norm = T, .do.norm = T)
+repDiversity(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 'div', 'read.count', 
+             .norm = T, .do.norm = T)
+
+# Gini coefficient - measure of inequality in the data (the larger the more unequal) (very used in economy)
+repDiversity(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 'gini', 'read.prop', 
+             .norm = T, .do.norm = T)
+repDiversity(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 'gini', 'read.prop', 
+             .norm = T, .do.norm = T)
+```
+
+
+
+Compute divergence between samples
+Jensen-Shannon divergence - similarity between two probability distributions. Related to the Kullback–Leibler divergence, a measure of "relative entropy".
+
+```{r}
+js_list = list(
+  BV_js = js.div.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                     HUMAN_TRBV, .verbose = F),
+  AV_js = js.div.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                     HUMAN_TRAV, .verbose = F),
+  
+  BJ_js = js.div.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                     HUMAN_TRBJ, .verbose = F),
+  AJ_js = js.div.seg(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                     HUMAN_TRAJ, .verbose = F)
+)
+
+for(n in names(js_list)){pheatmap::pheatmap(js_list[[n]], main = n)}
+```
+
+
+
+Dimensionality reduction by PCA with gene usage - how do different samples cluster based on their expression of VJ segments?
+This case will not be very informative as we are only looking at 4 samples.
+
+```{r}
+# use AJ and AV combination
+pca_2d = pca.segments.2D(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])],
+                              .genes =  list(HUMAN_TRAV, HUMAN_TRAJ), .do.plot = F)
+
+plot_df = merge(pca_2d$x, metadata, by = 0)
+
+ggplot(plot_df, aes(x = PC1, y = PC2, colour = condition, shape = tissue))+
+  geom_point(size = 2)+
+  scale_shape_manual(values = c(19, 2))+
+  ggtitle("TCR alpha PCA")+
+  theme_classic()+
+  theme(aspect.ratio = 1,
+        legend.position = "right")
+
+# use BJ and BV combination
+pca_2d = pca.segments.2D(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])],
+                              .genes =  list(HUMAN_TRBV, HUMAN_TRBJ), .do.plot = F)
+
+plot_df = merge(pca_2d$x, metadata, by = 0)
+
+ggplot(plot_df, aes(x = PC1, y = PC2, colour = condition, shape = tissue))+
+  geom_point(size = 2)+
+  scale_shape_manual(values = c(19, 2))+
+  ggtitle("TCR beta PCA")+
+  theme_classic()+
+  theme(aspect.ratio = 1,
+        legend.position = "right")
+```
+
+
+
+# Comparing repertoires
+Compute a pairwise normalised number of shared clonotypes and plot a heatmap of them
+Normalisation is important to avoid bisases by different library size and clonotype capture
+
+```{r}
+# TCRA
+ovelap_A_nuc_exact <- repOverlap(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                                    "exact", .norm = T, .seq = "nuc")
+ovelap_A_aa_exact <- repOverlap(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                                   "exact", .norm = T, .seq = "aa")
+vis.heatmap(ovelap_A_nuc_exact, .text = F, .title = "TCRA clonotype overlap\nNucleotide Sequence")
+vis.heatmap(ovelap_A_aa_exact, .text = F, .title = "TCRA clonotype overlap\nAminoacid Sequence")
+
+# TCRB
+ovelap_B_nuc_exact <- repOverlap(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                                    "exact", .norm = T, .seq = "nuc")
+ovelap_B_aa_exact <- repOverlap(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                                   "exact", .norm = T, .seq = "aa")
+vis.heatmap(ovelap_B_nuc_exact, .text = F, .title = "TCRB clonotype overlap\nNucleotide Sequence")
+vis.heatmap(ovelap_B_aa_exact, .text = F, .title = "TCRB clonotype overlap\nAminoacid Sequence")
+```
+
+
+
+Top cross - number of shared clonotypes among those most highly represented
+Important because these tend to be the most relevant forms of the TCR
+
+```{r}
+tcra_topcross <- top.cross(.data = cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                     .n = seq(500, 10000, 500), .verbose = F, .norm = T)
+top.cross.plot(tcra_topcross)
+
+tcrb_topcross <- top.cross(.data = cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                     .n = seq(500, 10000, 500), .verbose = F, .norm = T)
+top.cross.plot(tcrb_topcross)
+```
+
+
+
+Shared repertoire - number of shared clonotypes for each repertoire for each degree of sharing (i.e., number of samples in which indicated amount of clones have been found).
+
+```{r}
+shared_A_rep = shared.repertoire(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                                 .min.ppl = 2, .clear = T)
+shared.representation(shared_A_rep)
+
+shared_B_rep = shared.repertoire(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                                 .min.ppl = 2, .clear = T)
+shared.representation(shared_B_rep)
+```
+
+
+
+Shared repertoire mutation networks - how do the different clonotypes relate to each other by sequence similarity?
+
+```{r}
+# TCRBA
+shared_A_rep_top = shared.repertoire(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRA",])], 
+                                     .min.ppl = 2, .clear = T, .head = 2000)
+G_A <- mutation.network(shared_A_rep_top, .max.errors = 3)
+
+## plotting attributes
+V(G_A)$color = metadata[metadata$repertoire=="TCRA","condition"]
+V(G_A)$shape = metadata[metadata$repertoire=="TCRA","tissue"]
+
+## network layout
+l_A = igraph::layout.fruchterman.reingold(G_A)
+
+# TCRB
+shared_B_rep_top = shared.repertoire(cln_glio_list[rownames(metadata[metadata$repertoire=="TCRB",])], 
+                                     .min.ppl = 2, .clear = T, .head = 2000)
+G_B <- mutation.network(shared_B_rep_top, .max.errors = 3)
+
+## plotting attributes
+V(G_B)$color = metadata[metadata$repertoire=="TCRB","condition"]
+V(G_B)$shape = metadata[metadata$repertoire=="TCRB","tissue"]
+
+## network layout
+l_B = igraph::layout.fruchterman.reingold(G_B)
+```
+
+
+
+Making the actual network plot
+More info: https://plot.ly/r/network-graphs/
+
+```{r}
+# ploting function
+makePlotlyNetwork = function(igraph_obj, layout_net, title_net){
+  vs <- V(igraph_obj)
+  es <- as.data.frame(get.edgelist(igraph_obj))
+  
+  Nv <- length(vs)
+  Ne <- length(es[1]$V1)
+  
+  Xn <- layout_net[,1]
+  Yn <- layout_net[,2]
+  
+  network <- plotly::plot_ly(x = ~Xn, y = ~Yn, mode = "markers", text = vs$label, 
+                             hoverinfo = "text", color = vs$color, symbol = vs$shape, 
+                             symbols = c("19", "2"), colors = c("#FF0006", "#0080FF"))
+  edge_shapes <- list()
+  for(i in 1:Ne) {
+    v0 <- es[i,]$V1
+    v1 <- es[i,]$V2
+  
+    edge_shape = list(
+      type = "line",
+      line = list(color = "#030303", width = 0.3),
+      x0 = Xn[v0],
+      y0 = Yn[v0],
+      x1 = Xn[v1],
+      y1 = Yn[v1]
+    )
+  
+    edge_shapes[[i]] <- edge_shape
+  }
+  
+  axis <- list(title = "", showgrid = FALSE, showticklabels = FALSE, zeroline = FALSE)
+  
+  p <- plotly::layout(
+    network,
+    title = title_net,
+    shapes = edge_shapes,
+    xaxis = axis,
+    yaxis = axis
+  )
+}
+
+# make the plots
+p = makePlotlyNetwork(G_A, l_A, "TCRA mutation graph")
+p
+p = makePlotlyNetwork(G_B, l_B, "TCRB mutation graph")
+p
+```
+
+
+
+
+
+
+
